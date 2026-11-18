@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cloud Cost Threshold Alarm (Product 10) - software-only. Cost Explorer + Lambda + SNS + DynamoDB + EventBridge, with a live dashboard (virtual OLED + siren).
+
+Parameters:
+  DailyBudget:
+    Type: Number
+    Default: 1
+    Description: Daily spend limit in USD. Set a tiny value like 0.01 to trigger the alarm for your demo.
+  AlertEmail:
+    Type: String
+    Description: Email that receives the alarm (you must confirm the SNS subscription email).
+  CheckEveryHours:
+    Type: Number
+    Default: 6
+    AllowedValues: [3, 6, 12, 24]
+    Description: How often to check spend. Each Cost Explorer API call costs about $0.01.
+
+Resources:
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: cost-threshold-alarm
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  StatusTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  CheckerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: cost-alarm-checker
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Environment:
+        Variables:
+          TABLE: !Ref StatusTable
+          TOPIC: !Ref AlarmTopic
+          BUDGET: !Ref DailyBudget
+      Code:
+        ZipFile: |
+          import boto3, os, json, datetime as d
+          from decimal import Decimal
+          ce = boto3.client('ce')
+          sns = boto3.client('sns')
+          tbl = boto3.resource('dynamodb').Table(os.environ['TABLE'])
+
+          def handler(event, context):
+              today = d.datetime.utcnow().date()
+              start, end = today.isoformat(), (today + d.timedelta(days=1)).isoformat()
+              r = ce.get_cost_and_usage(
+                  TimePeriod={'Start': start, 'End': end},
+                  Granularity='DAILY', Metrics=['UnblendedCost'],
+                  GroupBy=[{'Type': 'DIMENSION', 'Key': 'SERVICE'}])
+              groups = r['ResultsByTime'][0].get('Groups', [])
+              costs = {g['Keys'][0]: float(g['Metrics']['UnblendedCost']['Amount']) for g in groups}
+              spend = round(sum(costs.values()), 4)
+              top = sorted(costs.items(), key=lambda x: -x[1])[:3]
+              budget = float(os.environ['BUDGET'])
+              over = spend > budget
+              prev = tbl.get_item(Key={'id': 'latest'}).get('Item', {})
+              alert_date = prev.get('alert_date', '')
+              if over and alert_date != start:
+                  lines = '\n'.join('  %s: $%.4f' % t for t in top)
+                  sns.publish(
+                      TopicArn=os.environ['TOPIC'],
+                      Subject='ALARM: AWS daily spend over budget',
+                      Message='Spend today: $%.4f\nBudget: $%.2f\n\nTop services:\n%s\n\nCheck your AWS account now.' % (spend, budget, lines))
+                  alert_date = start
+              tbl.put_item(Item={
+                  'id': 'latest', 'spend': Decimal(str(spend)), 'budget': Decimal(str(budget)),
+                  'over': over, 'updated': d.datetime.utcnow().isoformat() + 'Z',
+                  'top': json.dumps(top), 'alert_date': alert_date})
+              return {'spend': spend, 'over': over}
+
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: !Sub 'rate(${CheckEveryHours} hours)'
+      State: ENABLED
+      Targets:
+        - Id: checker
+          Arn: !GetAtt CheckerFunction.Arn
+
+  SchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CheckerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+  DashboardFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: cost-alarm-dashboard
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 15
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'
+      Environment:
+        Variables:
+          TABLE: !Ref StatusTable
+          BUDGET: !Ref DailyBudget
+          CHK: !Ref CheckerFunction
+      Code:
+        ZipFile: |
+          import boto3, os, json
+          H = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>Cloud Cost Alarm</title>
+          <style>body{margin:0;padding:10px;min-height:100vh;font-family:sans-serif;background:#064e3b;color:#fff;text-align:center}
+          .bad{animation:f .8s infinite}@keyframes f{50%{background:#b91c1c}}
+          #o{font:700 34px monospace;background:#000;color:#4ade80;margin:20px auto;padding:20px;width:85%;max-width:420px;border-radius:10px;border:4px solid #444}
+          button{padding:12px 16px;margin:5px;border:0;border-radius:8px;font-size:16px}</style>
+          <h2>Cloud Cost Alarm</h2><div id=o>Loading...</div><h3 id=s></h3><pre id=t></pre><small id=u></small><br>
+          <button onclick=en()>Enable siren</button><button onclick=run()>Check now</button><button onclick=sim()>Test siren</button>
+          <script>
+          var A,osc,iv,on=0,test=0,D={};
+          function en(){A=A||new AudioContext();A.resume();on=1;draw()}
+          function sim(){test=!test;draw()}
+          function stop(){if(osc){osc.stop();osc=null;clearInterval(iv)}}
+          function start(){if(osc||!on)return;osc=A.createOscillator();osc.type='sawtooth';osc.frequency.value=600;osc.connect(A.destination);osc.start();
+          iv=setInterval(function(){osc.frequency.value=osc.frequency.value>800?600:1000},400)}
+          function draw(){var bad=D.over||test,sp=(+D.spend||0).toFixed(2);
+          o.textContent=bad?'ALARM! $'+sp+' > $'+(+D.budget||0).toFixed(2):'$'+sp+' / $'+(+D.budget||0).toFixed(2);
+          o.style.color=bad?'#f87171':'#4ade80';document.body.className=bad?'bad':'';
+          s.textContent=bad?'BUDGET EXCEEDED':'Within budget';
+          var tp=[];try{tp=JSON.parse(D.top||'[]')}catch(e){}
+          t.textContent=tp.map(function(x){return x[0]+': $'+x[1].toFixed(4)}).join(String.fromCharCode(10));
+          u.textContent='Last check: '+(D.updated||'never');
+          if(bad)start();else stop()}
+          function load(){fetch('/api').then(function(r){return r.json()}).then(function(d){D=d;draw()})}
+          function run(){fetch('/run');o.textContent='Checking...';setTimeout(load,5000)}
+          setInterval(load,60000);load();
+          </script>"""
+
+          def handler(event, context):
+              p = event.get('rawPath', '/')
+              if p == '/run':
+                  boto3.client('lambda').invoke(FunctionName=os.environ['CHK'], InvocationType='Event')
+                  return {'statusCode': 200, 'body': 'ok'}
+              if p == '/api':
+                  item = boto3.resource('dynamodb').Table(os.environ['TABLE']).get_item(Key={'id': 'latest'}).get('Item') or {
+                      'spend': 0, 'budget': float(os.environ['BUDGET']), 'over': False, 'top': '[]'}
+                  return {'statusCode': 200, 'headers': {'content-type': 'application/json'},
+                          'body': json.dumps(item, default=float)}
+              return {'statusCode': 200, 'headers': {'content-type': 'text/html'}, 'body': H}
+
+  DashboardUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt DashboardFunction.Arn
+      AuthType: NONE
+
+  UrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DashboardFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  UrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DashboardFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
+Outputs:
+  DashboardURL:
+    Description: Open this link for the live dashboard with siren
+    Value: !GetAtt DashboardUrl.FunctionUrl
